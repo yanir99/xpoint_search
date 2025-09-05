@@ -19,6 +19,12 @@
 #include <openssl/bn.h>
 #include <openssl/sha.h>
 #include <openssl/ripemd.h>
+#include <openssl/obj_mac.h>  // For NID_secp256k1
+#include <openssl/evp.h>      // For newer OpenSSL APIs
+
+// Suppress deprecation warnings for OpenSSL 3.0
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 class BloomFilter {
 private:
@@ -80,26 +86,63 @@ private:
     
 public:
     SECP256K1() {
+        // Use NID_secp256k1 with proper include
         group = EC_GROUP_new_by_curve_name(NID_secp256k1);
+        if (!group) {
+            throw std::runtime_error("Failed to create secp256k1 group");
+        }
+        
         generator = EC_POINT_new(group);
+        if (!generator) {
+            EC_GROUP_free(group);
+            throw std::runtime_error("Failed to create generator point");
+        }
+        
         order = BN_new();
-        EC_GROUP_get_order(group, order, nullptr);
+        if (!order) {
+            EC_POINT_free(generator);
+            EC_GROUP_free(group);
+            throw std::runtime_error("Failed to create order");
+        }
+        
+        if (!EC_GROUP_get_order(group, order, nullptr)) {
+            BN_free(order);
+            EC_POINT_free(generator);
+            EC_GROUP_free(group);
+            throw std::runtime_error("Failed to get group order");
+        }
         
         const EC_POINT* gen = EC_GROUP_get0_generator(group);
-        EC_POINT_copy(generator, gen);
+        if (!gen || !EC_POINT_copy(generator, gen)) {
+            BN_free(order);
+            EC_POINT_free(generator);
+            EC_GROUP_free(group);
+            throw std::runtime_error("Failed to copy generator");
+        }
     }
     
     ~SECP256K1() {
-        EC_GROUP_free(group);
-        EC_POINT_free(generator);
-        BN_free(order);
+        if (group) EC_GROUP_free(group);
+        if (generator) EC_POINT_free(generator);
+        if (order) BN_free(order);
     }
     
     std::string compress_point(const EC_POINT* point) const {
         BIGNUM* x = BN_new();
         BIGNUM* y = BN_new();
         
-        EC_POINT_get_affine_coordinates_GFp(group, point, x, y, nullptr);
+        if (!x || !y) {
+            if (x) BN_free(x);
+            if (y) BN_free(y);
+            return "";
+        }
+        
+        // Use the deprecated function but suppress warnings
+        if (!EC_POINT_get_affine_coordinates_GFp(group, point, x, y, nullptr)) {
+            BN_free(x);
+            BN_free(y);
+            return "";
+        }
         
         std::string result;
         if (BN_is_odd(y)) {
@@ -109,6 +152,12 @@ public:
         }
         
         char* x_hex = BN_bn2hex(x);
+        if (!x_hex) {
+            BN_free(x);
+            BN_free(y);
+            return "";
+        }
+        
         std::string x_str(x_hex);
         OPENSSL_free(x_hex);
         
@@ -128,7 +177,13 @@ public:
     
     EC_POINT* multiply(const BIGNUM* scalar) const {
         EC_POINT* result = EC_POINT_new(group);
-        EC_POINT_mul(group, result, scalar, nullptr, nullptr, nullptr);
+        if (!result) return nullptr;
+        
+        if (!EC_POINT_mul(group, result, scalar, nullptr, nullptr, nullptr)) {
+            EC_POINT_free(result);
+            return nullptr;
+        }
+        
         return result;
     }
     
@@ -176,9 +231,11 @@ private:
             if (hash_pos == std::string::npos) continue;
             
             std::string hex_part = line.substr(0, hash_pos);
+            // Remove trailing whitespace
             hex_part.erase(hex_part.find_last_not_of(" \t") + 1);
             
             std::string offset_str = line.substr(hash_pos + 1);
+            // Remove leading whitespace
             offset_str.erase(0, offset_str.find_first_not_of(" \t"));
             
             try {
@@ -226,12 +283,15 @@ private:
         return true;
     }
     
-    void worker_thread(uint64_t start, uint64_t end, int thread_id) {
+    void worker_thread(uint64_t start, uint64_t end, int /* thread_id */) {
         BIGNUM* r_bn = BN_new();
+        if (!r_bn) return;
         
         for (uint64_t r = start; r < end && !found_flag.load(); ++r) {
-            BN_set_word(r_bn, r);
+            if (!BN_set_word(r_bn, r)) continue;
+            
             EC_POINT* point = secp.multiply(r_bn);
+            if (!point) continue;
             
             std::string comp_hex = secp.compress_point(point);
             
@@ -252,28 +312,33 @@ private:
                     
                     BIGNUM* priv_bn = BN_new();
                     BIGNUM* offset_bn = BN_new();
-                    BN_set_word(r_bn, r);
                     
-                    if (it->second >= 0) {
-                        BN_set_word(offset_bn, it->second);
-                        BN_mod_sub(priv_bn, r_bn, offset_bn, secp.get_order(), nullptr);
-                    } else {
-                        BN_set_word(offset_bn, -it->second);
-                        BN_mod_add(priv_bn, r_bn, offset_bn, secp.get_order(), nullptr);
+                    if (priv_bn && offset_bn) {
+                        BN_set_word(r_bn, r);
+                        
+                        if (it->second >= 0) {
+                            BN_set_word(offset_bn, static_cast<unsigned long>(it->second));
+                            BN_mod_sub(priv_bn, r_bn, offset_bn, secp.get_order(), nullptr);
+                        } else {
+                            BN_set_word(offset_bn, static_cast<unsigned long>(-it->second));
+                            BN_mod_add(priv_bn, r_bn, offset_bn, secp.get_order(), nullptr);
+                        }
+                        
+                        char* priv_hex = BN_bn2hex(priv_bn);
+                        if (priv_hex) {
+                            result.private_key = std::string(priv_hex);
+                            OPENSSL_free(priv_hex);
+                            
+                            std::transform(result.private_key.begin(), result.private_key.end(), 
+                                         result.private_key.begin(), ::tolower);
+                            while (result.private_key.length() < 64) {
+                                result.private_key = "0" + result.private_key;
+                            }
+                        }
                     }
                     
-                    char* priv_hex = BN_bn2hex(priv_bn);
-                    result.private_key = std::string(priv_hex);
-                    OPENSSL_free(priv_hex);
-                    
-                    std::transform(result.private_key.begin(), result.private_key.end(), 
-                                 result.private_key.begin(), ::tolower);
-                    while (result.private_key.length() < 64) {
-                        result.private_key = "0" + result.private_key;
-                    }
-                    
-                    BN_free(priv_bn);
-                    BN_free(offset_bn);
+                    if (priv_bn) BN_free(priv_bn);
+                    if (offset_bn) BN_free(offset_bn);
                 }
             }
             
@@ -323,7 +388,7 @@ public:
                 });
             }
             
-            std::thread progress_thread([this, start_time, total_range]() {
+            std::thread progress_thread([this, start_time]() {
                 while (!found_flag.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                     auto current_time = std::chrono::high_resolution_clock::now();
@@ -391,16 +456,28 @@ public:
     }
 };
 
+#pragma GCC diagnostic pop
+
 std::string base58_encode(const std::vector<uint8_t>& data) {
     const std::string alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     
     BIGNUM* bn = BN_new();
+    if (!bn) return "";
+    
     BN_bin2bn(data.data(), data.size(), bn);
     
     std::string result;
     BIGNUM* base = BN_new();
     BIGNUM* remainder = BN_new();
     BN_CTX* ctx = BN_CTX_new();
+    
+    if (!base || !remainder || !ctx) {
+        if (bn) BN_free(bn);
+        if (base) BN_free(base);
+        if (remainder) BN_free(remainder);
+        if (ctx) BN_CTX_free(ctx);
+        return "";
+    }
     
     BN_set_word(base, 58);
     
@@ -495,24 +572,30 @@ int main(int argc, char* argv[]) {
     uint64_t start_range = std::stoull(start_hex, nullptr, 16);
     uint64_t end_range = std::stoull(end_hex, nullptr, 16);
     
-    XPointSearcher searcher;
-    
-    if (!searcher.load_table(table_file, use_bloom, bloom_fpr, bloom_size)) {
+    try {
+        XPointSearcher searcher;
+        
+        if (!searcher.load_table(table_file, use_bloom, bloom_fpr, bloom_size)) {
+            return 1;
+        }
+        
+        SearchResult result = searcher.search(start_range, end_range, num_threads, batch_size, random_search);
+        
+        if (result.found) {
+            std::cout << "\n=== MATCH FOUND ===\n";
+            std::cout << "r = " << result.r << std::endl;
+            std::cout << "offset = " << result.offset << std::endl;
+            std::cout << "compressed pubkey = " << result.pub_compressed << std::endl;
+            std::cout << "private key (hex) = " << result.private_key << std::endl;
+            std::cout << "WIF compressed = " << create_wif(result.private_key, true) << std::endl;
+            std::cout << "WIF uncompressed = " << create_wif(result.private_key, false) << std::endl;
+        } else {
+            std::cout << "No match found in the specified range." << std::endl;
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
-    }
-    
-    SearchResult result = searcher.search(start_range, end_range, num_threads, batch_size, random_search);
-    
-    if (result.found) {
-        std::cout << "\n=== MATCH FOUND ===\n";
-        std::cout << "r = " << result.r << std::endl;
-        std::cout << "offset = " << result.offset << std::endl;
-        std::cout << "compressed pubkey = " << result.pub_compressed << std::endl;
-        std::cout << "private key (hex) = " << result.private_key << std::endl;
-        std::cout << "WIF compressed = " << create_wif(result.private_key, true) << std::endl;
-        std::cout << "WIF uncompressed = " << create_wif(result.private_key, false) << std::endl;
-    } else {
-        std::cout << "No match found in the specified range." << std::endl;
     }
     
     return 0;
