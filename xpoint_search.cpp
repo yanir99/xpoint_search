@@ -14,6 +14,7 @@
 #include <memory>
 #include <cstring>
 #include <cctype>
+#include <stdexcept>
 
 // OpenSSL includes for secp256k1
 #include <openssl/ec.h>
@@ -61,7 +62,7 @@ BIGNUM* hex_to_bignum(const std::string& hex_str) {
     return bn;
 }
 
-// BloomFilter (unchanged)
+// BloomFilter
 class BloomFilter {
 private:
     std::vector<uint8_t> bit_array;
@@ -70,6 +71,7 @@ private:
 
     std::vector<size_t> get_hashes(const std::string& item) const {
         std::vector<size_t> hashes;
+        if (size == 0) return hashes;
         for (int i = 0; i < hash_count; ++i) {
             std::string data = item + std::to_string(i);
             unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -86,15 +88,20 @@ private:
 
 public:
     BloomFilter(size_t n_items, double false_positive_rate = 0.001) {
-        double m = -(n_items * std::log(false_positive_rate)) / (std::log(2) * std::log(2));
-        size = static_cast<size_t>(m);
-        hash_count = std::max(1, static_cast<int>((size / static_cast<double>(n_items)) * std::log(2)));
+        if (n_items == 0) {
+            size = 8;
+            hash_count = 1;
+        } else {
+            double m = -(n_items * std::log(false_positive_rate)) / (std::log(2) * std::log(2));
+            size = static_cast<size_t>(std::max(8.0, m));
+            hash_count = std::max(1, static_cast<int>((size / static_cast<double>(n_items)) * std::log(2)));
+        }
         bit_array.resize(size, 0);
     }
 
     BloomFilter(size_t n_items, size_t fixed_size) {
-        size = fixed_size;
-        hash_count = std::max(1, static_cast<int>((size / static_cast<double>(n_items)) * std::log(2)));
+        size = std::max<size_t>(8, fixed_size);
+        hash_count = std::max(1, static_cast<int>((size / std::max(1.0, static_cast<double>(n_items))) * std::log(2)));
         bit_array.resize(size, 0);
     }
 
@@ -108,7 +115,7 @@ public:
     bool contains(const std::string& item) const {
         auto hashes = get_hashes(item);
         for (size_t idx : hashes) {
-            if (!bit_array[idx]) return false;
+            if (idx >= bit_array.size() || !bit_array[idx]) return false;
         }
         return true;
     }
@@ -162,7 +169,7 @@ public:
         if (order) BN_free(order);
     }
 
-    std::string compress_point(const EC_POINT* point) const {
+    std::string compress_point(const EC_POINT* point, BN_CTX* ctx) const {
         BIGNUM* x = BN_new();
         BIGNUM* y = BN_new();
 
@@ -172,18 +179,13 @@ public:
             return "";
         }
 
-        if (!EC_POINT_get_affine_coordinates_GFp(group, point, x, y, nullptr)) {
+        if (!EC_POINT_get_affine_coordinates_GFp(group, point, x, y, ctx)) {
             BN_free(x);
             BN_free(y);
             return "";
         }
 
-        std::string result;
-        if (BN_is_odd(y)) {
-            result = "03";
-        } else {
-            result = "02";
-        }
+        std::string result = BN_is_odd(y) ? "03" : "02";
 
         char* x_hex = BN_bn2hex(x);
         if (!x_hex) {
@@ -209,11 +211,11 @@ public:
         return result;
     }
 
-    EC_POINT* multiply(const BIGNUM* scalar) const {
+    EC_POINT* multiply(const BIGNUM* scalar, BN_CTX* ctx) const {
         EC_POINT* result = EC_POINT_new(group);
         if (!result) return nullptr;
 
-        if (!EC_POINT_mul(group, result, scalar, nullptr, nullptr, nullptr)) {
+        if (!EC_POINT_mul(group, result, scalar, nullptr, nullptr, ctx)) {
             EC_POINT_free(result);
             return nullptr;
         }
@@ -241,16 +243,15 @@ private:
     SECP256K1 secp;
     std::atomic<uint64_t> processed{0};
     std::atomic<bool> found_flag{false};
+    std::atomic<bool> done_flag{false};
     SearchResult result;
     std::mutex result_mutex;
 
     static bool parse_offset_to_bignum(const std::string& dec_str, BIGNUM** out) {
-        // dec_str can be extremely large; BN_dec2bn handles sign, as long as format is clean
         std::string s = dec_str;
         trim(s);
         if (s.empty()) return false;
 
-        // BN_dec2bn accepts an optional leading '-'
         BIGNUM* bn = nullptr;
         if (BN_dec2bn(&bn, s.c_str()) == 0) {
             if (bn) BN_free(bn);
@@ -271,7 +272,6 @@ private:
             pos = 1;
         }
         abs_dec = s.substr(pos);
-        // strip leading zeros in abs_dec
         size_t nz = 0;
         while (nz < abs_dec.size() && abs_dec[nz] == '0') ++nz;
         abs_dec = (nz == abs_dec.size()) ? "0" : abs_dec.substr(nz);
@@ -279,7 +279,6 @@ private:
     }
 
     static bool dec_to_bignum_positive(const std::string& abs_dec, BIGNUM** out) {
-        // abs_dec must be non-negative decimal, no sign
         if (abs_dec.empty()) return false;
         BIGNUM* bn = nullptr;
         if (BN_dec2bn(&bn, abs_dec.c_str()) == 0) {
@@ -302,7 +301,6 @@ private:
             return false;
         }
 
-        std::vector<int> dummy_presence; // not used, but keep logic structure
         std::string line;
         size_t line_count = 0;
         size_t valid_offsets = 0;
@@ -312,8 +310,6 @@ private:
             trim(line);
             if (line.empty()) continue;
 
-            // Allow lines possibly containing multiple entries; split on spaces " ... # ... "
-            // But simplest: find first '#' which separates key and decimal offset
             size_t hash_pos = line.find('#');
             if (hash_pos == std::string::npos) continue;
 
@@ -323,9 +319,10 @@ private:
             trim(hex_part);
             trim(offset_str);
 
-            if (hex_part.size() < 66) continue; // "02/03" + 64 hex
+            if (hex_part.size() < 66) continue; // compressed key len
             if (!(hex_part.rfind("02", 0) == 0 || hex_part.rfind("03", 0) == 0)) continue;
-            // Keep only the first token of hex_part in case there was packed data on a single line
+
+            // Keep only first token in case of packed lines
             {
                 std::istringstream iss(hex_part);
                 std::string first;
@@ -333,24 +330,18 @@ private:
                 hex_part = first;
             }
 
-            // Validate hex length after trimming
-            if (hex_part.size() != 66) {
-                continue;
-            }
+            if (hex_part.size() != 66) continue;
 
-            // Offset may be extremely large; store raw decimal string
-            // Validate it can be parsed into BIGNUM:
+            // Validate offset parses to BN
             BIGNUM* test = nullptr;
-            if (!parse_offset_to_bignum(offset_str, &test)) {
-                continue;
-            }
+            if (!parse_offset_to_bignum(offset_str, &test)) continue;
             BN_free(test);
 
             table[hex_part] = offset_str;
             ++valid_offsets;
             ++line_count;
 
-            if (line_count % 10000000 == 0) {
+            if (line_count % 1000000 == 0) {
                 std::cout << "Loaded " << line_count << " entries..." << std::endl;
             }
         }
@@ -385,12 +376,16 @@ private:
     }
 
     void worker_thread_bignum(const BIGNUM* start_bn, const BIGNUM* end_bn,
-                              uint64_t max_iterations, int /* thread_id */) {
+                              uint64_t max_iterations, int /*thread_id*/) {
+        BN_CTX* ctx = BN_CTX_new();
+        if (!ctx) return;
+
         BIGNUM* r_bn = BN_new();
         BIGNUM* one = BN_new();
         if (!r_bn || !one) {
             if (r_bn) BN_free(r_bn);
             if (one) BN_free(one);
+            BN_CTX_free(ctx);
             return;
         }
 
@@ -399,14 +394,21 @@ private:
 
         uint64_t iterations = 0;
         while (BN_cmp(r_bn, end_bn) <= 0 && !found_flag.load() && iterations < max_iterations) {
-            EC_POINT* point = secp.multiply(r_bn);
+            EC_POINT* point = secp.multiply(r_bn, ctx);
             if (!point) {
                 BN_add(r_bn, r_bn, one);
                 iterations++;
                 continue;
             }
 
-            std::string comp_hex = secp.compress_point(point);
+            std::string comp_hex = secp.compress_point(point, ctx);
+
+            if (comp_hex.size() != 66) {
+                EC_POINT_free(point);
+                BN_add(r_bn, r_bn, one);
+                iterations++;
+                continue;
+            }
 
             if (bloom && !bloom->contains(comp_hex)) {
                 EC_POINT_free(point);
@@ -431,8 +433,6 @@ private:
                     result.pub_compressed = comp_hex;
                     result.offset_dec = it->second; // decimal string
 
-                    // Compute private key = r - offset (mod n) if offset >= 0
-                    // or r + |offset| (mod n) if offset < 0
                     bool is_neg = false;
                     std::string abs_dec;
                     if (parse_offset_abs_sign(it->second, is_neg, abs_dec)) {
@@ -441,10 +441,10 @@ private:
                         if (priv_bn && dec_to_bignum_positive(abs_dec, &off_abs_bn)) {
                             if (!is_neg) {
                                 // r - offset mod n
-                                BN_mod_sub(priv_bn, r_bn, off_abs_bn, secp.get_order(), nullptr);
+                                BN_mod_sub(priv_bn, r_bn, off_abs_bn, secp.get_order(), ctx);
                             } else {
                                 // r + |offset| mod n
-                                BN_mod_add(priv_bn, r_bn, off_abs_bn, secp.get_order(), nullptr);
+                                BN_mod_add(priv_bn, r_bn, off_abs_bn, secp.get_order(), ctx);
                             }
 
                             char* priv_hex = BN_bn2hex(priv_bn);
@@ -473,6 +473,7 @@ private:
 
         BN_free(r_bn);
         BN_free(one);
+        BN_CTX_free(ctx);
     }
 
 public:
@@ -487,6 +488,7 @@ public:
 
         result = SearchResult{false, "", "", "", ""};
         found_flag.store(false);
+        done_flag.store(false);
         processed.store(0);
 
         BIGNUM* start_bn = hex_to_bignum(start_hex);
@@ -499,30 +501,54 @@ public:
             return result;
         }
 
+        if (BN_cmp(start_bn, end_bn) > 0) {
+            std::swap(start_bn, end_bn);
+        }
+
         std::cout << "Searching range: " << start_hex << " to " << end_hex << std::endl;
+        if (num_threads <= 0) num_threads = 1;
         std::cout << "Using " << num_threads << " threads" << std::endl;
         std::cout << "Max iterations per thread: " << max_per_thread << std::endl;
 
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        // Calculate range per thread
-        BIGNUM* range_bn = BN_new();
-        BIGNUM* thread_range_bn = BN_new();
-        BIGNUM* thread_count_bn = BN_new();
-
-        if (!range_bn || !thread_range_bn || !thread_count_bn) {
-            std::cerr << "Error: Failed to allocate BIGNUM for range calculation" << std::endl;
-            if (start_bn) BN_free(start_bn);
-            if (end_bn) BN_free(end_bn);
-            if (range_bn) BN_free(range_bn);
-            if (thread_range_bn) BN_free(thread_range_bn);
-            if (thread_count_bn) BN_free(thread_count_bn);
+        BN_CTX* ctx = BN_CTX_new();
+        if (!ctx) {
+            std::cerr << "Error: Failed to create BN_CTX" << std::endl;
+            BN_free(start_bn);
+            BN_free(end_bn);
             return result;
         }
 
-        BN_sub(range_bn, end_bn, start_bn);
+        // Calculate range per thread: inclusive bounds
+        BIGNUM* range_bn = BN_new();
+        BIGNUM* thread_range_bn = BN_new();
+        BIGNUM* thread_count_bn = BN_new();
+        BIGNUM* one = BN_new();
+
+        if (!range_bn || !thread_range_bn || !thread_count_bn || !one) {
+            std::cerr << "Error: Failed to allocate BIGNUM for range calculation" << std::endl;
+            if (range_bn) BN_free(range_bn);
+            if (thread_range_bn) BN_free(thread_range_bn);
+            if (thread_count_bn) BN_free(thread_count_bn);
+            if (one) BN_free(one);
+            BN_free(start_bn);
+            BN_free(end_bn);
+            BN_CTX_free(ctx);
+            return result;
+        }
+
+        BN_sub(range_bn, end_bn, start_bn);    // range = end - start
+        BN_set_word(one, 1);
+        BN_add(range_bn, range_bn, one);       // inclusive: range = end - start + 1
+
         BN_set_word(thread_count_bn, static_cast<unsigned long>(num_threads));
-        BN_div(thread_range_bn, nullptr, range_bn, thread_count_bn, nullptr);
+        // thread_range = range / threads
+        BN_div(thread_range_bn, nullptr, range_bn, thread_count_bn, ctx);
+        // Ensure thread_range >= 1
+        if (BN_is_zero(thread_range_bn)) {
+            BN_set_word(thread_range_bn, 1);
+        }
 
         std::vector<std::thread> threads;
 
@@ -531,7 +557,6 @@ public:
             BIGNUM* thread_end = BN_new();
             BIGNUM* i_bn = BN_new();
             BIGNUM* temp = BN_new();
-
             if (!thread_start || !thread_end || !i_bn || !temp) {
                 if (thread_start) BN_free(thread_start);
                 if (thread_end) BN_free(thread_end);
@@ -541,17 +566,33 @@ public:
             }
 
             BN_set_word(i_bn, static_cast<unsigned long>(i));
-            BN_mul(temp, i_bn, thread_range_bn, nullptr);
-            BN_add(thread_start, start_bn, temp);
+            BN_mul(temp, i_bn, thread_range_bn, ctx);           // temp = i * thread_range
+            BN_add(thread_start, start_bn, temp);               // start + temp
 
-            if (i == num_threads - 1) {
+            BN_copy(thread_end, thread_start);
+            BN_add(thread_end, thread_end, thread_range_bn);    // start + (i+1)*thread_range
+            BN_sub(thread_end, thread_end, one);                // inclusive end = above - 1
+
+            // Clamp to global end
+            if (BN_cmp(thread_end, end_bn) > 0) {
                 BN_copy(thread_end, end_bn);
-            } else {
-                BN_add(thread_end, thread_start, thread_range_bn);
             }
 
-            threads.emplace_back([this, thread_start, thread_end, max_per_thread, i]() {
-                worker_thread_bignum(thread_start, thread_end, max_per_thread, i);
+            // Skip if start > end (possible last thread)
+            if (BN_cmp(thread_start, thread_end) > 0) {
+                BN_free(thread_start);
+                BN_free(thread_end);
+                BN_free(i_bn);
+                BN_free(temp);
+                continue;
+            }
+
+            threads.emplace_back([this, thread_start, thread_end, max_per_thread]() {
+                try {
+                    worker_thread_bignum(thread_start, thread_end, max_per_thread, 0);
+                } catch (...) {
+                    // swallow exceptions to avoid terminating process
+                }
                 BN_free(thread_start);
                 BN_free(thread_end);
             });
@@ -562,14 +603,15 @@ public:
 
         // Progress monitoring
         std::thread progress_thread([this, start_time]() {
-            while (!found_flag.load()) {
+            using namespace std::chrono;
+            while (!done_flag.load()) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-                auto current_time = std::chrono::high_resolution_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
+                auto current_time = high_resolution_clock::now();
+                auto elapsed = duration_cast<std::chrono::seconds>(current_time - start_time).count();
 
                 uint64_t current_processed = processed.load();
                 if (elapsed > 0) {
-                    double speed = static_cast<double>(current_processed) / elapsed;
+                    double speed = static_cast<double>(current_processed) / std::max<int64_t>(1, elapsed);
                     std::cout << "\rProcessed: " << current_processed
                               << " @ " << std::fixed << std::setprecision(2)
                               << speed << " keys/s" << std::flush;
@@ -578,14 +620,15 @@ public:
         });
 
         for (auto& t : threads) {
-            t.join();
+            if (t.joinable()) t.join();
         }
-        progress_thread.join();
+        done_flag.store(true);
+        if (progress_thread.joinable()) progress_thread.join();
 
         std::cout << std::endl;
 
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto total_time = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+        auto end_time_tp = std::chrono::high_resolution_clock::now();
+        auto total_time = std::chrono::duration_cast<std::chrono::seconds>(end_time_tp - start_time).count();
 
         std::cout << "Search completed in " << total_time << " seconds." << std::endl;
         std::cout << "Total keys processed: " << processed.load() << std::endl;
@@ -595,6 +638,8 @@ public:
         BN_free(range_bn);
         BN_free(thread_range_bn);
         BN_free(thread_count_bn);
+        BN_free(one);
+        BN_CTX_free(ctx);
 
         return result;
     }
@@ -602,14 +647,14 @@ public:
 
 #pragma GCC diagnostic pop
 
-// Base58 and WIF (unchanged)
+// Base58 and WIF
 std::string base58_encode(const std::vector<uint8_t>& data) {
     const std::string alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
     BIGNUM* bn = BN_new();
     if (!bn) return "";
 
-    BN_bin2bn(data.data(), data.size(), bn);
+    BN_bin2bn(data.data(), static_cast<int>(data.size()), bn);
 
     std::string result;
     BIGNUM* base = BN_new();
@@ -626,11 +671,29 @@ std::string base58_encode(const std::vector<uint8_t>& data) {
 
     BN_set_word(base, 58);
 
-    while (!BN_is_zero(bn)) {
-        BN_div(bn, remainder, bn, base, ctx);
-        result = alphabet[BN_get_word(remainder)] + result;
+    BIGNUM* q = BN_new();
+    if (!q) {
+        BN_free(bn); BN_free(base); BN_free(remainder); BN_CTX_free(ctx);
+        return "";
     }
 
+    // Loop: bn = bn / base, remainder = bn % base
+    while (!BN_is_zero(bn)) {
+        if (!BN_div(q, remainder, bn, base, ctx)) {
+            BN_free(bn); BN_free(base); BN_free(remainder); BN_free(q); BN_CTX_free(ctx);
+            return "";
+        }
+        // Move quotient back to bn
+        BN_copy(bn, q);
+        unsigned long rem = BN_get_word(remainder);
+        if (rem >= alphabet.size()) {
+            BN_free(bn); BN_free(base); BN_free(remainder); BN_free(q); BN_CTX_free(ctx);
+            return "";
+        }
+        result = alphabet[rem] + result;
+    }
+
+    // Handle leading zeros
     for (uint8_t byte : data) {
         if (byte == 0) {
             result = "1" + result;
@@ -642,6 +705,7 @@ std::string base58_encode(const std::vector<uint8_t>& data) {
     BN_free(bn);
     BN_free(base);
     BN_free(remainder);
+    BN_free(q);
     BN_CTX_free(ctx);
 
     return result;
@@ -649,9 +713,10 @@ std::string base58_encode(const std::vector<uint8_t>& data) {
 
 std::string create_wif(const std::string& private_key_hex, bool compressed = true) {
     std::vector<uint8_t> data;
+    data.reserve(1 + 32 + 1 + 4);
     data.push_back(0x80);
 
-    for (size_t i = 0; i < private_key_hex.length(); i += 2) {
+    for (size_t i = 0; i + 1 < private_key_hex.length(); i += 2) {
         std::string byte_str = private_key_hex.substr(i, 2);
         uint8_t byte = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
         data.push_back(byte);
