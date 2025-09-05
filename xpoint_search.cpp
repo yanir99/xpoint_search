@@ -26,6 +26,46 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
+// Helper function to convert hex string to BIGNUM
+BIGNUM* hex_to_bignum(const std::string& hex_str) {
+    BIGNUM* bn = BN_new();
+    if (!bn) return nullptr;
+    
+    std::string clean_hex = hex_str;
+    // Remove 0x prefix if present
+    if (clean_hex.length() >= 2 && 
+        (clean_hex.substr(0, 2) == "0x" || clean_hex.substr(0, 2) == "0X")) {
+        clean_hex = clean_hex.substr(2);
+    }
+    
+    if (BN_hex2bn(&bn, clean_hex.c_str()) == 0) {
+        BN_free(bn);
+        return nullptr;
+    }
+    
+    return bn;
+}
+
+// Helper function to convert BIGNUM to uint64_t (with range checking)
+bool bignum_to_uint64(const BIGNUM* bn, uint64_t& result) {
+    if (!bn) return false;
+    
+    // Check if value fits in uint64_t
+    BIGNUM* max_uint64 = BN_new();
+    if (!max_uint64) return false;
+    
+    BN_set_word(max_uint64, UINT64_MAX);
+    
+    if (BN_cmp(bn, max_uint64) > 0) {
+        BN_free(max_uint64);
+        return false; // Too large for uint64_t
+    }
+    
+    result = BN_get_word(bn);
+    BN_free(max_uint64);
+    return true;
+}
+
 class BloomFilter {
 private:
     std::vector<uint8_t> bit_array;
@@ -193,7 +233,7 @@ public:
 
 struct SearchResult {
     bool found;
-    uint64_t r;
+    std::string r_hex;
     int64_t offset;
     std::string pub_compressed;
     std::string private_key;
@@ -283,20 +323,34 @@ private:
         return true;
     }
     
-    void worker_thread(uint64_t start, uint64_t end, int /* thread_id */) {
+    void worker_thread_bignum(const BIGNUM* start_bn, const BIGNUM* end_bn, 
+                             uint64_t max_iterations, int /* thread_id */) {
         BIGNUM* r_bn = BN_new();
-        if (!r_bn) return;
+        BIGNUM* one = BN_new();
+        if (!r_bn || !one) {
+            if (r_bn) BN_free(r_bn);
+            if (one) BN_free(one);
+            return;
+        }
         
-        for (uint64_t r = start; r < end && !found_flag.load(); ++r) {
-            if (!BN_set_word(r_bn, r)) continue;
-            
+        BN_copy(r_bn, start_bn);
+        BN_set_word(one, 1);
+        
+        uint64_t iterations = 0;
+        while (BN_cmp(r_bn, end_bn) <= 0 && !found_flag.load() && iterations < max_iterations) {
             EC_POINT* point = secp.multiply(r_bn);
-            if (!point) continue;
+            if (!point) {
+                BN_add(r_bn, r_bn, one);
+                iterations++;
+                continue;
+            }
             
             std::string comp_hex = secp.compress_point(point);
             
             if (bloom && !bloom->contains(comp_hex)) {
                 EC_POINT_free(point);
+                BN_add(r_bn, r_bn, one);
+                iterations++;
                 continue;
             }
             
@@ -306,7 +360,13 @@ private:
                 if (!found_flag.load()) {
                     found_flag.store(true);
                     result.found = true;
-                    result.r = r;
+                    
+                    char* r_hex_str = BN_bn2hex(r_bn);
+                    if (r_hex_str) {
+                        result.r_hex = std::string(r_hex_str);
+                        OPENSSL_free(r_hex_str);
+                    }
+                    
                     result.offset = it->second;
                     result.pub_compressed = comp_hex;
                     
@@ -314,8 +374,6 @@ private:
                     BIGNUM* offset_bn = BN_new();
                     
                     if (priv_bn && offset_bn) {
-                        BN_set_word(r_bn, r);
-                        
                         if (it->second >= 0) {
                             BN_set_word(offset_bn, static_cast<unsigned long>(it->second));
                             BN_mod_sub(priv_bn, r_bn, offset_bn, secp.get_order(), nullptr);
@@ -344,9 +402,12 @@ private:
             
             EC_POINT_free(point);
             processed.fetch_add(1);
+            BN_add(r_bn, r_bn, one);
+            iterations++;
         }
         
         BN_free(r_bn);
+        BN_free(one);
     }
     
 public:
@@ -355,94 +416,106 @@ public:
         return load_table_chunked(filename, use_bloom, bloom_fpr, bloom_size);
     }
     
-    SearchResult search(uint64_t start_range, uint64_t end_range, 
-                       int num_threads = std::thread::hardware_concurrency(),
-                       uint64_t batch_size = 100000, bool random_search = false) {
+    SearchResult search_bignum(const std::string& start_hex, const std::string& end_hex,
+                              int num_threads = std::thread::hardware_concurrency(),
+                              uint64_t max_per_thread = 1000000) {
         
-        result = SearchResult{false, 0, 0, "", ""};
+        result = SearchResult{false, "", 0, "", ""};
         found_flag.store(false);
         processed.store(0);
         
-        uint64_t total_range = end_range - start_range + 1;
-        std::cout << "Searching range: 0x" << std::hex << start_range 
-                  << " to 0x" << end_range << std::dec << std::endl;
-        std::cout << "Total range: " << total_range << " keys" << std::endl;
+        BIGNUM* start_bn = hex_to_bignum(start_hex);
+        BIGNUM* end_bn = hex_to_bignum(end_hex);
+        
+        if (!start_bn || !end_bn) {
+            std::cerr << "Error: Invalid hex range values" << std::endl;
+            if (start_bn) BN_free(start_bn);
+            if (end_bn) BN_free(end_bn);
+            return result;
+        }
+        
+        std::cout << "Searching range: " << start_hex << " to " << end_hex << std::endl;
         std::cout << "Using " << num_threads << " threads" << std::endl;
+        std::cout << "Max iterations per thread: " << max_per_thread << std::endl;
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
-        if (random_search) {
-            std::vector<std::thread> threads;
-            std::random_device rd;
-            
-            for (int i = 0; i < num_threads; ++i) {
-                threads.emplace_back([this, start_range, end_range, batch_size, i, &rd]() {
-                    std::mt19937_64 gen(rd() + i);
-                    std::uniform_int_distribution<uint64_t> dist(start_range, end_range);
-                    
-                    while (!found_flag.load()) {
-                        uint64_t random_start = dist(gen);
-                        uint64_t random_end = std::min(random_start + batch_size, end_range + 1);
-                        worker_thread(random_start, random_end, i);
-                    }
-                });
-            }
-            
-            std::thread progress_thread([this, start_time]() {
-                while (!found_flag.load()) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                    auto current_time = std::chrono::high_resolution_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
-                    uint64_t current_processed = processed.load();
-                    
-                    if (elapsed > 0) {
-                        double speed = static_cast<double>(current_processed) / elapsed;
-                        std::cout << "\rProcessed: " << current_processed 
-                                  << " @ " << std::fixed << std::setprecision(2) 
-                                  << speed << " keys/s" << std::flush;
-                    }
-                }
-            });
-            
-            for (auto& t : threads) {
-                t.join();
-            }
-            progress_thread.join();
-            
-        } else {
-            std::vector<std::thread> threads;
-            uint64_t chunk_size = total_range / num_threads;
-            
-            for (int i = 0; i < num_threads; ++i) {
-                uint64_t thread_start = start_range + i * chunk_size;
-                uint64_t thread_end = (i == num_threads - 1) ? end_range + 1 : thread_start + chunk_size;
-                
-                threads.emplace_back(&XPointSearcher::worker_thread, this, 
-                                   thread_start, thread_end, i);
-            }
-            
-            std::thread progress_thread([this, start_time, total_range]() {
-                while (!found_flag.load()) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                    auto current_time = std::chrono::high_resolution_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
-                    uint64_t current_processed = processed.load();
-                    
-                    if (elapsed > 0) {
-                        double speed = static_cast<double>(current_processed) / elapsed;
-                        double percentage = (static_cast<double>(current_processed) / total_range) * 100.0;
-                        std::cout << "\rProgress: " << current_processed << "/" << total_range 
-                                  << " (" << std::fixed << std::setprecision(2) << percentage << "%) @ " 
-                                  << speed << " keys/s" << std::flush;
-                    }
-                }
-            });
-            
-            for (auto& t : threads) {
-                t.join();
-            }
-            progress_thread.join();
+        // Calculate range per thread
+        BIGNUM* range_bn = BN_new();
+        BIGNUM* thread_range_bn = BN_new();
+        BIGNUM* thread_count_bn = BN_new();
+        
+        if (!range_bn || !thread_range_bn || !thread_count_bn) {
+            std::cerr << "Error: Failed to allocate BIGNUM for range calculation" << std::endl;
+            if (start_bn) BN_free(start_bn);
+            if (end_bn) BN_free(end_bn);
+            if (range_bn) BN_free(range_bn);
+            if (thread_range_bn) BN_free(thread_range_bn);
+            if (thread_count_bn) BN_free(thread_count_bn);
+            return result;
         }
+        
+        BN_sub(range_bn, end_bn, start_bn);
+        BN_set_word(thread_count_bn, num_threads);
+        BN_div(thread_range_bn, nullptr, range_bn, thread_count_bn, nullptr);
+        
+        std::vector<std::thread> threads;
+        
+        for (int i = 0; i < num_threads; ++i) {
+            BIGNUM* thread_start = BN_new();
+            BIGNUM* thread_end = BN_new();
+            BIGNUM* i_bn = BN_new();
+            BIGNUM* temp = BN_new();
+            
+            if (!thread_start || !thread_end || !i_bn || !temp) {
+                if (thread_start) BN_free(thread_start);
+                if (thread_end) BN_free(thread_end);
+                if (i_bn) BN_free(i_bn);
+                if (temp) BN_free(temp);
+                continue;
+            }
+            
+            BN_set_word(i_bn, i);
+            BN_mul(temp, i_bn, thread_range_bn, nullptr);
+            BN_add(thread_start, start_bn, temp);
+            
+            if (i == num_threads - 1) {
+                BN_copy(thread_end, end_bn);
+            } else {
+                BN_add(thread_end, thread_start, thread_range_bn);
+            }
+            
+            threads.emplace_back([this, thread_start, thread_end, max_per_thread, i]() {
+                worker_thread_bignum(thread_start, thread_end, max_per_thread, i);
+                BN_free(thread_start);
+                BN_free(thread_end);
+            });
+            
+            BN_free(i_bn);
+            BN_free(temp);
+        }
+        
+        // Progress monitoring
+        std::thread progress_thread([this, start_time]() {
+            while (!found_flag.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                auto current_time = std::chrono::high_resolution_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
+                uint64_t current_processed = processed.load();
+                
+                if (elapsed > 0) {
+                    double speed = static_cast<double>(current_processed) / elapsed;
+                    std::cout << "\rProcessed: " << current_processed 
+                              << " @ " << std::fixed << std::setprecision(2) 
+                              << speed << " keys/s" << std::flush;
+                }
+            }
+        });
+        
+        for (auto& t : threads) {
+            t.join();
+        }
+        progress_thread.join();
         
         std::cout << std::endl;
         
@@ -451,6 +524,12 @@ public:
         
         std::cout << "Search completed in " << total_time << " seconds." << std::endl;
         std::cout << "Total keys processed: " << processed.load() << std::endl;
+        
+        BN_free(start_bn);
+        BN_free(end_bn);
+        BN_free(range_bn);
+        BN_free(thread_range_bn);
+        BN_free(thread_count_bn);
         
         return result;
     }
@@ -532,12 +611,13 @@ int main(int argc, char* argv[]) {
     if (argc < 4) {
         std::cout << "Usage: " << argv[0] << " <table_file> <start_range_hex> <end_range_hex> [options]\n";
         std::cout << "Options:\n";
-        std::cout << "  --threads <n>     Number of threads (default: hardware concurrency)\n";
-        std::cout << "  --batch <n>       Batch size (default: 100000)\n";
-        std::cout << "  --bloom           Enable Bloom filter\n";
-        std::cout << "  --bloom-fpr <f>   Bloom filter false positive rate (default: 0.001)\n";
-        std::cout << "  --bloom-size <n>  Fixed Bloom filter size\n";
-        std::cout << "  --random          Use random search instead of sequential\n";
+        std::cout << "  --threads <n>         Number of threads (default: hardware concurrency)\n";
+        std::cout << "  --max-per-thread <n>  Max iterations per thread (default: 1000000)\n";
+        std::cout << "  --bloom               Enable Bloom filter\n";
+        std::cout << "  --bloom-fpr <f>       Bloom filter false positive rate (default: 0.001)\n";
+        std::cout << "  --bloom-size <n>      Fixed Bloom filter size\n";
+        std::cout << "\nNote: This version uses BIGNUM for large hex values\n";
+        std::cout << "Example: " << argv[0] << " table.txt 8000000000 ffffffffff --threads 4\n";
         return 1;
     }
     
@@ -546,31 +626,48 @@ int main(int argc, char* argv[]) {
     std::string end_hex = argv[3];
     
     int num_threads = std::thread::hardware_concurrency();
-    uint64_t batch_size = 100000;
+    uint64_t max_per_thread = 1000000;
     bool use_bloom = false;
     double bloom_fpr = 0.001;
     size_t bloom_size = 0;
-    bool random_search = false;
     
     for (int i = 4; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--threads" && i + 1 < argc) {
             num_threads = std::stoi(argv[++i]);
-        } else if (arg == "--batch" && i + 1 < argc) {
-            batch_size = std::stoull(argv[++i]);
+        } else if (arg == "--max-per-thread" && i + 1 < argc) {
+            max_per_thread = std::stoull(argv[++i]);
         } else if (arg == "--bloom") {
             use_bloom = true;
         } else if (arg == "--bloom-fpr" && i + 1 < argc) {
             bloom_fpr = std::stod(argv[++i]);
         } else if (arg == "--bloom-size" && i + 1 < argc) {
             bloom_size = std::stoull(argv[++i]);
-        } else if (arg == "--random") {
-            random_search = true;
         }
     }
     
-    uint64_t start_range = std::stoull(start_hex, nullptr, 16);
-    uint64_t end_range = std::stoull(end_hex, nullptr, 16);
+    // Validate hex strings
+    BIGNUM* test_start = hex_to_bignum(start_hex);
+    BIGNUM* test_end = hex_to_bignum(end_hex);
+    
+    if (!test_start || !test_end) {
+        std::cerr << "Error: Invalid hexadecimal range values" << std::endl;
+        std::cerr << "Start: " << start_hex << std::endl;
+        std::cerr << "End: " << end_hex << std::endl;
+        if (test_start) BN_free(test_start);
+        if (test_end) BN_free(test_end);
+        return 1;
+    }
+    
+    if (BN_cmp(test_start, test_end) > 0) {
+        std::cerr << "Error: Start range is greater than end range" << std::endl;
+        BN_free(test_start);
+        BN_free(test_end);
+        return 1;
+    }
+    
+    BN_free(test_start);
+    BN_free(test_end);
     
     try {
         XPointSearcher searcher;
@@ -579,11 +676,11 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         
-        SearchResult result = searcher.search(start_range, end_range, num_threads, batch_size, random_search);
+        SearchResult result = searcher.search_bignum(start_hex, end_hex, num_threads, max_per_thread);
         
         if (result.found) {
             std::cout << "\n=== MATCH FOUND ===\n";
-            std::cout << "r = " << result.r << std::endl;
+            std::cout << "r = 0x" << result.r_hex << std::endl;
             std::cout << "offset = " << result.offset << std::endl;
             std::cout << "compressed pubkey = " << result.pub_compressed << std::endl;
             std::cout << "private key (hex) = " << result.private_key << std::endl;
