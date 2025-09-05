@@ -16,7 +16,7 @@ LIBS = -lssl -lcrypto
 CXXFLAGS += -mcpu=apple-m1 -ffast-math -funroll-loops
 
 TARGET = xpoint_search
-SOURCE = xpoint_search_fixed.cpp
+SOURCE = xpoint_search.cpp
 
 .PHONY: all clean install-deps check-openssl
 
